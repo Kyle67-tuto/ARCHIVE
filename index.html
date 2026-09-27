@@ -281,12 +281,15 @@
     <div id="composer" style="display:none;">
       <div id="attachRow" style="display:none;">
         <input type="url" id="videoUrlInput" placeholder="Paste a video URL (YouTube or direct .mp4 link)">
+        <button id="uploadVidBtn" class="ghost" title="Upload a video from your device">📤 Upload from device</button>
       </div>
       <div id="pendingImageArea" style="display:none; margin-bottom:8px;"></div>
+      <div id="pendingVideoArea" style="display:none; margin-bottom:8px;"></div>
       <div id="composerRow">
         <button id="attachImgBtn" class="ghost" title="Attach image">🖼️</button>
-        <button id="attachVidBtn" class="ghost" title="Attach video link">🎬</button>
+        <button id="attachVidBtn" class="ghost" title="Attach video">🎬</button>
         <input type="file" id="imgFileInput" accept="image/*" style="display:none;">
+        <input type="file" id="vidFileInput" accept="video/*" style="display:none;">
         <textarea id="textInput" placeholder="Message #general"></textarea>
         <button id="sendBtn" class="primary">Send</button>
       </div>
@@ -349,6 +352,9 @@ import {
   getFirestore, collection, doc, getDoc, getDocs, setDoc, updateDoc, query, orderBy,
   limit, addDoc, deleteDoc, onSnapshot, where, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+import {
+  getStorage, ref as storageRef, uploadBytes, getDownloadURL
+} from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
 /* ============ CONFIG ============ */
 const firebaseConfig = {
@@ -380,6 +386,7 @@ function roomBySlug(slug){ return allRooms().find(r => r.slug === slug) || GENER
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const storage = getStorage(app);
 const provider = new GoogleAuthProvider();
 
 let currentUser = null;      // firebase auth user
@@ -388,6 +395,7 @@ let currentRoom = 'general';
 let unsubMessages = null;
 let unsubUsers = null;
 let pendingImageUrl = null;
+let pendingVideoUrl = null;
 let usersCache = [];
 
 const el = (id) => document.getElementById(id);
@@ -525,6 +533,7 @@ onAuthStateChanged(auth, async (user) => {
         updateComposerVisibility();
       }
     });
+    if (isAdmin()) maybeSeedDefaultRooms();
   } else {
     currentProfile = null;
   }
@@ -532,6 +541,30 @@ onAuthStateChanged(auth, async (user) => {
   updateComposerVisibility();
   loadMessages();
 });
+
+/* One-time setup: when the admin first signs in and no rooms have been created yet,
+   auto-create room_1 through room_19 as separate Discord-style channels/windows,
+   so the sidebar is populated immediately instead of starting empty. Each still
+   lives in its own doc afterward, so it can be renamed or deleted independently. */
+async function maybeSeedDefaultRooms(){
+  try{
+    const seedRef = doc(db, 'meta', 'roomsSeed');
+    const seedSnap = await getDoc(seedRef);
+    if (seedSnap.exists()) return; // already seeded once — never repeat, even if rooms were later deleted
+    await setDoc(seedRef, { seededAt: serverTimestamp() });
+    const creates = [];
+    for (let i = 1; i <= 19; i++){
+      creates.push(addDoc(collection(db, 'roomsMeta'), {
+        slug: `room_${i}`,
+        name: `room_${i}`,
+        createdAt: serverTimestamp()
+      }));
+    }
+    await Promise.all(creates);
+  }catch(e){
+    console.warn('Default room seeding skipped:', e.message);
+  }
+}
 
 /* ============ COMPOSER VISIBILITY ============ */
 function updateComposerVisibility(){
@@ -720,6 +753,44 @@ async function uploadToImgBB(file){
   return json.data.url;
 }
 
+/* Video files go to Firebase Storage (ImgBB only hosts images) — requires the
+   project's Storage security rules to allow authenticated writes/reads. */
+el('uploadVidBtn').onclick = () => el('vidFileInput').click();
+
+el('vidFileInput').onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const area = el('pendingVideoArea');
+  area.style.display = 'block';
+  area.innerHTML = '<div class="pending-chip">Uploading video…</div>';
+  try{
+    const url = await uploadToFirebaseStorage(file);
+    pendingVideoUrl = url;
+    el('videoUrlInput').value = '';
+    area.innerHTML = '';
+    const chip = document.createElement('div');
+    chip.className = 'pending-chip';
+    chip.innerHTML = `<span>🎬 ${file.name}</span>`;
+    const rm = document.createElement('button');
+    rm.textContent = '✕';
+    rm.onclick = () => { pendingVideoUrl = null; area.style.display='none'; area.innerHTML=''; };
+    chip.appendChild(rm);
+    area.appendChild(chip);
+  }catch(err){
+    area.innerHTML = '';
+    area.style.display = 'none';
+    toast('Video upload failed: ' + err.message);
+  }
+  e.target.value = '';
+};
+
+async function uploadToFirebaseStorage(file){
+  const path = `videos/${currentUser.uid}/${Date.now()}_${file.name}`;
+  const ref = storageRef(storage, path);
+  await uploadBytes(ref, file);
+  return await getDownloadURL(ref);
+}
+
 el('sendBtn').onclick = sendMessage;
 el('textInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey){
@@ -734,7 +805,8 @@ async function sendMessage(){
   if (currentProfile?.isBanned) return toast('Your account is banned from posting.');
 
   const text = el('textInput').value.trim();
-  const videoUrl = el('videoUrlInput').value.trim();
+  // An uploaded video file takes priority over a pasted link if both were somehow set.
+  const videoUrl = pendingVideoUrl || el('videoUrlInput').value.trim();
 
   if (!text && !pendingImageUrl && !videoUrl) return;
 
@@ -754,8 +826,11 @@ async function sendMessage(){
     el('videoUrlInput').value = '';
     el('attachRow').style.display = 'none';
     pendingImageUrl = null;
+    pendingVideoUrl = null;
     el('pendingImageArea').style.display = 'none';
     el('pendingImageArea').innerHTML = '';
+    el('pendingVideoArea').style.display = 'none';
+    el('pendingVideoArea').innerHTML = '';
   }catch(e){
     toast('Send failed: ' + e.message);
   }
