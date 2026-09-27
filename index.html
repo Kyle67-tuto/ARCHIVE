@@ -1,8 +1,11 @@
-<!DOCTYPE html>
+<<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Nightline — Community Chat &amp; Media Forum</title>
 <style>
   :root{
@@ -354,7 +357,7 @@ import {
   limit, addDoc, deleteDoc, onSnapshot, where, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 import {
-  getStorage, ref as storageRef, uploadBytes, getDownloadURL
+  getStorage, ref as storageRef, uploadBytesResumable, getDownloadURL
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
 /* ============ CONFIG ============ */
@@ -758,39 +761,57 @@ async function uploadToImgBB(file){
    project's Storage security rules to allow authenticated writes/reads. */
 el('uploadVidBtn').onclick = () => el('vidFileInput').click();
 
-el('vidFileInput').onchange = async (e) => {
+el('vidFileInput').onchange = (e) => {
   const file = e.target.files[0];
   if (!file) return;
   const area = el('pendingVideoArea');
   area.style.display = 'block';
-  area.innerHTML = '<div class="pending-chip">Uploading video…</div>';
-  try{
-    const url = await uploadToFirebaseStorage(file);
-    pendingVideoUrl = url;
-    el('videoUrlInput').value = '';
-    area.innerHTML = '';
-    const chip = document.createElement('div');
-    chip.className = 'pending-chip';
-    chip.innerHTML = `<span>🎬 ${file.name}</span>`;
-    const rm = document.createElement('button');
-    rm.textContent = '✕';
-    rm.onclick = () => { pendingVideoUrl = null; area.style.display='none'; area.innerHTML=''; };
-    chip.appendChild(rm);
-    area.appendChild(chip);
-  }catch(err){
-    area.innerHTML = '';
-    area.style.display = 'none';
-    toast('Video upload failed: ' + err.message);
-  }
-  e.target.value = '';
-};
 
-async function uploadToFirebaseStorage(file){
+  const chip = document.createElement('div');
+  chip.className = 'pending-chip';
+  const sizeMB = (file.size / (1024*1024)).toFixed(1);
+  chip.innerHTML = `<span>🎬 Uploading ${file.name} (${sizeMB} MB)… 0%</span>`;
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = '✕';
+  chip.appendChild(cancelBtn);
+  area.innerHTML = '';
+  area.appendChild(chip);
+
   const path = `videos/${currentUser.uid}/${Date.now()}_${file.name}`;
   const ref = storageRef(storage, path);
-  await uploadBytes(ref, file);
-  return await getDownloadURL(ref);
-}
+  const task = uploadBytesResumable(ref, file);
+  cancelBtn.onclick = () => { task.cancel(); };
+
+  task.on('state_changed',
+    (snap) => {
+      const pct = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
+      chip.querySelector('span').textContent = `🎬 Uploading ${file.name} (${sizeMB} MB)… ${pct}%`;
+    },
+    (err) => {
+      // Real errors (permission-denied, storage not enabled, cancelled, offline, etc.)
+      // are shown persistently in the chip itself instead of a toast that can be missed.
+      chip.innerHTML = '';
+      const errSpan = document.createElement('span');
+      errSpan.textContent = `⚠️ Upload failed: ${err.code || err.message}`;
+      const dismiss = document.createElement('button');
+      dismiss.textContent = '✕';
+      dismiss.onclick = () => { area.style.display = 'none'; area.innerHTML = ''; };
+      chip.appendChild(errSpan);
+      chip.appendChild(dismiss);
+    },
+    async () => {
+      const url = await getDownloadURL(task.snapshot.ref);
+      pendingVideoUrl = url;
+      el('videoUrlInput').value = '';
+      chip.innerHTML = `<span>🎬 ${file.name} — ready to send</span>`;
+      const rm = document.createElement('button');
+      rm.textContent = '✕';
+      rm.onclick = () => { pendingVideoUrl = null; area.style.display='none'; area.innerHTML=''; };
+      chip.appendChild(rm);
+    }
+  );
+  e.target.value = '';
+};
 
 el('sendBtn').onclick = sendMessage;
 el('textInput').addEventListener('keydown', (e) => {
