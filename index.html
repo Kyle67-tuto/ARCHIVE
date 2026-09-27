@@ -316,7 +316,17 @@
 <div class="modal-backdrop" id="adminModalBackdrop">
   <div class="modal wide">
     <div class="modal-top"><h3>Admin panel</h3><button class="ghost" data-close="adminModalBackdrop">✕</button></div>
-    <label style="margin-top:0;">Users</label>
+
+    <div class="modal-top" style="margin-top:0;">
+      <label style="margin:0;">Rooms</label>
+      <button id="addRoomBtn">+ New room</button>
+    </div>
+    <table class="userlist">
+      <thead><tr><th>Room</th><th>Slug</th><th>Actions</th></tr></thead>
+      <tbody id="adminRoomRows"></tbody>
+    </table>
+
+    <label>Users</label>
     <table class="userlist">
       <thead><tr><th>User</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="adminUserRows"></tbody>
@@ -351,14 +361,20 @@ const firebaseConfig = {
   measurementId: "G-NDQER8NPM9"
 };
 
-// TODO: set this to the Admin's Firebase Auth UID before deploying.
-// (Find it in Firebase Console > Authentication > Users, after the admin signs in once.)
-const ADMIN_UID = "REPLACE_WITH_ADMIN_UID";
+// The admin account — recognized by email, so no manual UID lookup is needed.
+const ADMIN_EMAIL = "anwarbah96@gmail.com";
 
 const IMGBB_API_KEY = "8d6b86a95a0dec73a237d731a3d7e095";
 
-const ROOMS = ['general','room_1','room_2','room_3','room_4','room_5','room_6','room_7','room_8',
-  'room_9','room_10','room_11','room_12','room_13','room_14','room_15','room_16','room_17','room_18','room_19'];
+// 'general' is a fixed, permanent room — always open to everyone, cannot be renamed or deleted.
+const GENERAL_ROOM = { slug: 'general', name: 'general', fixed: true };
+// Everything else is admin-managed and lives in the 'roomsMeta' Firestore collection,
+// so admins can rename, delete, or create rooms at runtime (see ROOM MANAGEMENT below).
+let customRooms = [];        // [{ id, slug, name }] — id is the Firestore doc id
+let unsubRoomsMeta = null;
+
+function allRooms(){ return [GENERAL_ROOM, ...customRooms]; }
+function roomBySlug(slug){ return allRooms().find(r => r.slug === slug) || GENERAL_ROOM; }
 
 /* ============ INIT ============ */
 const app = initializeApp(firebaseConfig);
@@ -375,7 +391,7 @@ let pendingImageUrl = null;
 let usersCache = [];
 
 const el = (id) => document.getElementById(id);
-const isAdmin = () => !!currentUser && currentUser.uid === ADMIN_UID;
+const isAdmin = () => !!currentUser && (currentUser.email || '').toLowerCase() === ADMIN_EMAIL.toLowerCase();
 const canPostInRoom = (room) => {
   if (!currentUser) return false;
   if (currentProfile?.isBanned) return false;
@@ -395,26 +411,42 @@ function toast(msg){
 function renderRoomList(){
   const list = el('roomList');
   list.innerHTML = '';
-  ROOMS.forEach(r => {
+  allRooms().forEach(r => {
     const btn = document.createElement('button');
-    btn.className = 'room-btn' + (r === currentRoom ? ' active' : '');
-    btn.innerHTML = `<span>#${r}</span>` + (r !== 'general' ? '<span class="lock">🔒</span>' : '');
-    btn.onclick = () => switchRoom(r);
+    btn.className = 'room-btn' + (r.slug === currentRoom ? ' active' : '');
+    btn.innerHTML = `<span>#${r.name}</span>` + (!r.fixed ? '<span class="lock">🔒</span>' : '');
+    btn.onclick = () => switchRoom(r.slug);
     list.appendChild(btn);
   });
 }
 
-function switchRoom(room){
-  currentRoom = room;
+function switchRoom(slug){
+  currentRoom = slug;
   renderRoomList();
-  el('roomTitle').textContent = '#' + room;
-  el('roomSub').textContent = room === 'general'
+  const r = roomBySlug(slug);
+  el('roomTitle').textContent = '#' + r.name;
+  el('roomSub').textContent = r.fixed
     ? 'Open to everyone — anyone signed in can post'
     : 'Admin-only room — announcements & curated media';
-  el('textInput').placeholder = 'Message #' + room;
+  el('textInput').placeholder = 'Message #' + r.name;
   document.getElementById('sidebar').classList.remove('open');
   loadMessages();
   updateComposerVisibility();
+}
+
+/* Live-subscribe to the admin-managed room list so every viewer's sidebar
+   updates instantly when the admin renames, deletes, or creates a room. */
+function watchRoomsMeta(){
+  unsubRoomsMeta = onSnapshot(query(collection(db, 'roomsMeta'), orderBy('createdAt', 'asc')), (snap) => {
+    customRooms = [];
+    snap.forEach(d => customRooms.push({ id: d.id, ...d.data() }));
+    renderRoomList();
+    // If the room we're currently viewing was deleted, fall back to general.
+    if (currentRoom !== 'general' && !customRooms.some(r => r.slug === currentRoom)){
+      switchRoom('general');
+    }
+    if (isAdmin()) renderRoomRows();
+  });
 }
 
 /* ============ AUTH ============ */
@@ -768,7 +800,74 @@ el('saveProfileBtn').onclick = async () => {
 function openAdminPanel(){
   if (!isAdmin()) return;
   loadUserList();
+  renderRoomRows();
   openModal('adminModalBackdrop');
+}
+
+/* ---- Room management (create / rename / delete) ---- */
+function renderRoomRows(){
+  const tbody = el('adminRoomRows');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  allRooms().forEach(r => {
+    const tr = document.createElement('tr');
+    const nameTd = document.createElement('td');
+    nameTd.textContent = r.name + (r.fixed ? ' (fixed)' : '');
+    const slugTd = document.createElement('td');
+    slugTd.textContent = r.slug;
+    const actionsTd = document.createElement('td');
+    actionsTd.className = 'actions';
+    if (!r.fixed){
+      const renameBtn = document.createElement('button');
+      renameBtn.textContent = 'Rename';
+      renameBtn.onclick = () => renameRoom(r);
+      const delBtn = document.createElement('button');
+      delBtn.className = 'danger';
+      delBtn.textContent = 'Delete';
+      delBtn.onclick = () => deleteRoom(r);
+      actionsTd.appendChild(renameBtn);
+      actionsTd.appendChild(delBtn);
+    }
+    tr.appendChild(nameTd); tr.appendChild(slugTd); tr.appendChild(actionsTd);
+    tbody.appendChild(tr);
+  });
+}
+
+el('addRoomBtn').onclick = async () => {
+  const name = prompt('Name for the new room (e.g. announcements):');
+  if (!name || !name.trim()) return;
+  // Generate a unique, URL/Firestore-safe slug so it never collides with an existing room path.
+  const base = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'room';
+  const slug = `${base}_${Date.now().toString(36)}`;
+  try{
+    await addDoc(collection(db, 'roomsMeta'), {
+      slug,
+      name: name.trim(),
+      createdAt: serverTimestamp()
+    });
+    toast('Room created.');
+  }catch(e){ toast('Could not create room: ' + e.message); }
+};
+
+async function renameRoom(room){
+  const newName = prompt(`Rename #${room.name} to:`, room.name);
+  if (!newName || !newName.trim() || newName.trim() === room.name) return;
+  try{
+    await updateDoc(doc(db, 'roomsMeta', room.id), { name: newName.trim() });
+    toast('Room renamed.');
+    if (currentRoom === room.slug){
+      el('roomTitle').textContent = '#' + newName.trim();
+      el('textInput').placeholder = 'Message #' + newName.trim();
+    }
+  }catch(e){ toast('Rename failed: ' + e.message); }
+}
+
+async function deleteRoom(room){
+  if (!confirm(`Delete #${room.name}? Its message history will no longer be reachable from the sidebar.`)) return;
+  try{
+    await deleteDoc(doc(db, 'roomsMeta', room.id));
+    toast('Room deleted.');
+  }catch(e){ toast('Delete failed: ' + e.message); }
 }
 
 function loadUserList(){
@@ -788,12 +887,13 @@ function renderUserRows(){
   usersCache.forEach(u => {
     const tr = document.createElement('tr');
     const nameTd = document.createElement('td');
-    nameTd.textContent = (u.displayName || 'User') + (u.id === ADMIN_UID ? ' (admin)' : '');
+    const uIsAdmin = (u.email || '').toLowerCase() === ADMIN_EMAIL.toLowerCase();
+    nameTd.textContent = (u.displayName || 'User') + (uIsAdmin ? ' (admin)' : '');
     const statusTd = document.createElement('td');
     statusTd.innerHTML = u.isBanned ? '<span class="status-banned">Banned</span>' : '<span class="status-ok">Active</span>';
     const actionsTd = document.createElement('td');
     actionsTd.className = 'actions';
-    if (u.id !== ADMIN_UID){
+    if (!uIsAdmin){
       const btn = document.createElement('button');
       btn.className = u.isBanned ? '' : 'danger';
       btn.textContent = u.isBanned ? 'Unban' : 'Ban';
@@ -834,6 +934,7 @@ el('menuBtn').onclick = () => document.getElementById('sidebar').classList.toggl
 
 /* ============ BOOT ============ */
 renderRoomList();
+watchRoomsMeta();
 switchRoom('general');
 </script>
 </body>
